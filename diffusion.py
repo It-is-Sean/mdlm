@@ -93,7 +93,10 @@ class Diffusion(L.LightningModule):
       self.backbone = models.dit.DIT(
         self.config, vocab_size=self.vocab_size)
     elif self.config.backbone == 'dimamba':
-      self.backbone = models.dimamba.DiMamba(
+      # DiMamba has optional causal-conv1d/Mamba dependencies. Import it only
+      # when selected so DiT training does not require the unused stack.
+      from models import dimamba
+      self.backbone = dimamba.DiMamba(
         self.config,
         vocab_size=self.vocab_size,
         pad_token_id=self.tokenizer.pad_token_id)
