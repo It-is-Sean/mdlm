@@ -11,6 +11,7 @@ import zipfile
 
 import datasets
 import fsspec
+import numpy as np
 import requests
 import tokenizers
 import torch
@@ -19,6 +20,57 @@ import transformers
 import utils
 
 LOGGER = utils.get_logger(__name__)
+
+
+class PackedROCStories(torch.utils.data.Dataset):
+  """Fixed-length ROCStories blocks from the shared GPT-2 token cache."""
+
+  def __init__(self, cache_dir, split, block_size):
+    path = os.path.join(cache_dir, f'{split}.bin')
+    metadata_path = os.path.join(cache_dir, 'metadata.json')
+    if not os.path.isfile(path):
+      raise FileNotFoundError(f'ROCStories packed split not found: {path}')
+    if not os.path.isfile(metadata_path):
+      raise FileNotFoundError(
+        f'ROCStories packed metadata not found: {metadata_path}')
+
+    with open(metadata_path, encoding='utf-8') as handle:
+      metadata = json.load(handle)
+    dtype_name = metadata.get('fingerprint', {}).get('dtype')
+    if dtype_name not in {'uint16', 'uint32'}:
+      raise ValueError(
+        f'Unsupported ROCStories token dtype {dtype_name!r} in '
+        f'{metadata_path}')
+
+    self.path = path
+    self.dtype = np.dtype(dtype_name)
+    self.block_size = block_size
+    token_count = os.path.getsize(path) // self.dtype.itemsize
+    self.num_blocks = token_count // block_size
+    dropped_tokens = token_count % block_size
+    self._tokens = None
+    LOGGER.info(
+      f'ROCStories {split}: {self.num_blocks:,} packed blocks from {path}; '
+      f'dropped tail tokens={dropped_tokens}')
+
+  def _memmap(self):
+    if self._tokens is None:
+      self._tokens = np.memmap(
+        self.path, dtype=self.dtype, mode='r',
+        shape=(self.num_blocks, self.block_size))
+    return self._tokens
+
+  def __len__(self):
+    return self.num_blocks
+
+  def __getitem__(self, index):
+    # Copy so torch never receives a read-only memmap view.
+    input_ids = torch.from_numpy(
+      np.array(self._memmap()[index], dtype=np.int64, copy=True))
+    return {
+      'input_ids': input_ids,
+      'attention_mask': torch.ones(self.block_size, dtype=torch.float32),
+    }
 
 
 def wt_detokenizer(string):
@@ -303,6 +355,14 @@ def _group_texts(examples, block_size, bos, eos):
 def get_dataset(
     dataset_name, tokenizer, wrap, mode, cache_dir,
     block_size=1024, num_proc=len(os.sched_getaffinity(0)), streaming=False):
+  if dataset_name == 'rocstories':
+    if mode not in ('train', 'validation'):
+      raise ValueError(
+        f'ROCStories supports train/validation, received mode={mode!r}')
+    if not wrap:
+      raise ValueError('Packed ROCStories must use data.wrap=true')
+    return PackedROCStories(cache_dir, mode, block_size)
+
   if wrap:
     filename = f'{dataset_name}_{mode}_bs{block_size}_wrapped.dat'
   else:
