@@ -18,6 +18,7 @@ import torch
 import transformers
 
 import utils
+from rocstories import PROTOCOL, PackedROCStories, FullGlobalBatchSampler
 
 LOGGER = utils.get_logger(__name__)
 
@@ -372,7 +373,11 @@ def get_dataset(
       raise ValueError(
         f'ROCStories supports train/validation, received mode={mode!r}')
     if not wrap:
-      raise ValueError('Story-aligned ROCStories must use data.wrap=true')
+      raise ValueError('ROCStories must use data.wrap=true')
+    with open(os.path.join(cache_dir, 'metadata.json'), encoding='utf-8') as handle:
+      protocol = json.load(handle).get('fingerprint', {}).get('protocol')
+    if protocol == PROTOCOL:
+      return PackedROCStories(cache_dir, mode, block_size, tokenizer)
     return ROCStories(cache_dir, mode, block_size)
 
   if wrap:
@@ -596,7 +601,7 @@ def get_tokenizer(config):
 
 def get_dataloaders(config, tokenizer, skip_train=False,
                     skip_valid=False, valid_seed=None):
-  num_gpus = torch.cuda.device_count()
+  num_gpus = int(config.trainer.devices)
   assert (config.loader.global_batch_size
           == (config.loader.batch_size
               * config.trainer.num_nodes
@@ -642,17 +647,31 @@ def get_dataloaders(config, tokenizer, skip_train=False,
   if skip_train:
     train_loader = None
   else:
+    packed = isinstance(train_set, PackedROCStories)
+    if (config.data.get('protocol') == PROTOCOL) != packed:
+      raise ValueError('ROCStories training protocol must match its cache')
+    sampler = None
+    if packed:
+      sampler = FullGlobalBatchSampler(
+        train_set, config.loader.global_batch_size,
+        num_replicas=num_gpus * config.trainer.num_nodes,
+        rank=int(os.environ.get('NODE_RANK', 0)) * num_gpus
+             + int(os.environ.get('LOCAL_RANK', 0)), seed=config.seed)
     train_loader = torch.utils.data.DataLoader(
       train_set,
       batch_size=config.loader.batch_size,
       num_workers=config.loader.num_workers,
       pin_memory=config.loader.pin_memory,
-      shuffle=not config.data.streaming,
-      persistent_workers=True)
+      shuffle=not config.data.streaming and sampler is None,
+      sampler=sampler,
+      drop_last=packed,
+      persistent_workers=config.loader.num_workers > 0)
     train_loader.tokenizer = tokenizer
   if skip_valid:
     valid_loader = None
   else:
+    if (config.data.get('protocol') == PROTOCOL) != isinstance(valid_set, PackedROCStories):
+      raise ValueError('ROCStories validation protocol must match its cache')
     if valid_seed is None:
       shuffle_valid = False
       generator = None

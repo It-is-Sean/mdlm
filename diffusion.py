@@ -17,6 +17,7 @@ import dataloader
 import models
 import noise_schedule
 import utils
+from rocstories import PROTOCOL, FullGlobalBatchSampler, read_metadata
 
 LOG2 = math.log(2)
 
@@ -73,6 +74,10 @@ class Diffusion(L.LightningModule):
     super().__init__()
     self.save_hyperparameters()
     self.config = config
+    self.packed_fingerprint = (
+      read_metadata(config.data.cache_dir)['fingerprint']
+      if config.data.get('protocol') == PROTOCOL else None)
+    self._packed_next_batch = 0
 
     self.tokenizer = tokenizer
     self.vocab_size = self.tokenizer.vocab_size
@@ -169,6 +174,27 @@ class Diffusion(L.LightningModule):
       assert self.parameterization == 'd3pm'
 
   def on_load_checkpoint(self, checkpoint):
+    if self.packed_fingerprint is not None:
+      if checkpoint.get('rocstories_fingerprint') != self.packed_fingerprint:
+        raise ValueError('Cannot resume a story-aligned or different-cache checkpoint as packed MDLM')
+      saved = checkpoint['hyper_parameters']['config']
+      for section in ('model', 'optim', 'training', 'noise', 'lr_scheduler'):
+        if saved[section] != self.config[section]:
+          raise ValueError(f'Resume requires unchanged {section}')
+      for section, key in (('loader', 'global_batch_size'), ('loader', 'batch_size'),
+                           ('trainer', 'devices'), ('trainer', 'num_nodes'),
+                           ('trainer', 'accumulate_grad_batches')):
+        if saved[section][key] != self.config[section][key]:
+          raise ValueError(f'Resume requires unchanged {section}.{key}')
+      if saved.seed != self.config.seed:
+        raise ValueError('Resume requires unchanged seed')
+      self.fast_forward_epochs = checkpoint['packed_progress']['epoch']
+      self.fast_forward_batches = checkpoint['packed_progress']['batches']
+      if self.ema:
+        self.ema.load_state_dict(checkpoint['ema'])
+      return
+    if checkpoint.get('rocstories_fingerprint') is not None:
+      raise ValueError('Cannot resume packed MDLM under the story-aligned protocol')
     if self.ema:
       self.ema.load_state_dict(checkpoint['ema'])
     # Copied from:
@@ -182,6 +208,11 @@ class Diffusion(L.LightningModule):
   def on_save_checkpoint(self, checkpoint):
     if self.ema:
       checkpoint['ema'] = self.ema.state_dict()
+    if self.packed_fingerprint is not None:
+      checkpoint['rocstories_fingerprint'] = self.packed_fingerprint
+      checkpoint['packed_progress'] = {
+        'epoch': self.current_epoch, 'batches': self._packed_next_batch}
+      return  # Keep Lightning's loop counters intact, as in packed Duo.
     # Copied from:
     # https://github.com/Dao-AILab/flash-attention/blob/main/training/src/tasks/seq.py
     # ['epoch_loop.batch_progress']['total']['completed'] is 1 iteration
@@ -220,6 +251,16 @@ class Diffusion(L.LightningModule):
   def on_train_start(self):
     if self.ema:
       self.ema.move_shadow_params_to_device(self.device)
+    if self.packed_fingerprint is not None:
+      for dl in self.trainer.fit_loop._combined_loader.flattened:
+        if not isinstance(dl.sampler, FullGlobalBatchSampler):
+          raise ValueError('Packed training requires the full-global-batch sampler')
+        if self.fast_forward_batches is not None:
+          dl.sampler.set_epoch(self.fast_forward_epochs)
+          dl.sampler.start_index = self.fast_forward_batches * dl.batch_size
+          if not 0 <= dl.sampler.start_index <= dl.sampler.num_samples:
+            raise ValueError('Invalid packed checkpoint data position')
+      return
     # Adapted from:
     # https://github.com/Dao-AILab/flash-attention/blob/main/training/src/datamodules/language_modeling_hf.py
     distributed = (
@@ -396,6 +437,7 @@ class Diffusion(L.LightningModule):
     self.noise.train()
 
   def training_step(self, batch, batch_idx):
+    self._packed_next_batch = batch_idx + 1
     loss = self._compute_loss(batch, prefix='train')
     self.log(name='trainer/loss',
              value=loss.item(),
