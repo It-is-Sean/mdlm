@@ -312,11 +312,14 @@ class Diffusion(L.LightningModule):
     assert sigma.ndim == 1, sigma.shape
     return sigma
 
-  def forward(self, x, sigma):
+  def forward(self, x, sigma, attention_mask=None):
     """Returns log score."""
     sigma = self._process_sigma(sigma)
     with torch.cuda.amp.autocast(dtype=torch.float32):
-      logits = self.backbone(x, sigma)
+      if self.config.backbone == 'dit':
+        logits = self.backbone(x, sigma, attention_mask=attention_mask)
+      else:
+        logits = self.backbone(x, sigma)
     
     if self.parameterization == 'subs':
       return self._subs_parameterization(logits=logits,
@@ -847,7 +850,7 @@ class Diffusion(L.LightningModule):
                           dim=-1,
                           index=x0[:, :, None]).squeeze(-1)
 
-  def _forward_pass_diffusion(self, x0):
+  def _forward_pass_diffusion(self, x0, attention_mask=None):
     t = self._sample_t(x0.shape[0], x0.device)
     if self.T > 0:
       t = (t * self.T).to(torch.int)
@@ -867,7 +870,8 @@ class Diffusion(L.LightningModule):
       move_chance = 1 - torch.exp(-sigma[:, None])
 
     xt = self.q_xt(x0, move_chance)
-    model_output = self.forward(xt, unet_conditioning)
+    model_output = self.forward(
+      xt, unet_conditioning, attention_mask=attention_mask)
     utils.print_nans(model_output, 'model_output')
 
     if self.parameterization == 'sedd':
@@ -906,7 +910,7 @@ class Diffusion(L.LightningModule):
       loss = - logprobs.gather(
         -1, output_tokens[:, :, None])[:, :, 0]
     else:
-      loss = self._forward_pass_diffusion(input_tokens)
+      loss = self._forward_pass_diffusion(input_tokens, attention_mask)
     
     nlls = loss * attention_mask
     count = attention_mask.sum()

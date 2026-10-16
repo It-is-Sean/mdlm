@@ -241,7 +241,7 @@ class DDiTBlock(nn.Module):
       return bias_dropout_add_scale_fused_inference
 
 
-  def forward(self, x, rotary_cos_sin, c, seqlens=None):
+  def forward(self, x, rotary_cos_sin, c, attention_mask=None):
     batch_size, seq_len = x.shape[0], x.shape[1]
 
     bias_dropout_scale_fn = self._get_bias_dropout_scale()
@@ -262,17 +262,28 @@ class DDiTBlock(nn.Module):
       cos, sin = rotary_cos_sin
       qkv = apply_rotary_pos_emb(
         qkv, cos.to(qkv.dtype), sin.to(qkv.dtype))
-    qkv = rearrange(qkv, 'b s ... -> (b s) ...')
-    if seqlens is None:
+    if attention_mask is None:
+      qkv = rearrange(qkv, 'b s ... -> (b s) ...')
       cu_seqlens = torch.arange(
         0, (batch_size + 1) * seq_len, step=seq_len,
         dtype=torch.int32, device=qkv.device)
+      x = flash_attn.flash_attn_interface.flash_attn_varlen_qkvpacked_func(
+        qkv, cu_seqlens, seq_len, 0., causal=False)
+      x = rearrange(x, '(b s) h d -> b s (h d)', b=batch_size)
     else:
-      cu_seqlens = seqlens.cumsum(-1)
-    x = flash_attn.flash_attn_interface.flash_attn_varlen_qkvpacked_func(
-      qkv, cu_seqlens, seq_len, 0., causal=False)
-    
-    x = rearrange(x, '(b s) h d -> b s (h d)', b=batch_size)
+      if attention_mask.shape != (batch_size, seq_len):
+        raise ValueError(
+          f'attention_mask must have shape {(batch_size, seq_len)}, got '
+          f'{attention_mask.shape}')
+      q, k, v = qkv.unbind(dim=2)
+      x = F.scaled_dot_product_attention(
+        query=q.transpose(1, 2),
+        key=k.transpose(1, 2),
+        value=v.transpose(1, 2),
+        attn_mask=attention_mask[:, None, None, :].to(torch.bool),
+        dropout_p=0.0,
+        is_causal=False)
+      x = rearrange(x.transpose(1, 2), 'b s h d -> b s (h d)')
 
     x = bias_dropout_scale_fn(self.attn_out(x),
                               None,
@@ -356,7 +367,7 @@ class DIT(nn.Module, huggingface_hub.PyTorchModelHubMixin):
     else:
       return  bias_dropout_add_scale_fused_inference
 
-  def forward(self, indices, sigma):
+  def forward(self, indices, sigma, attention_mask=None):
     x = self.vocab_embed(indices)
     c = F.silu(self.sigma_map(sigma))
 
@@ -364,7 +375,7 @@ class DIT(nn.Module, huggingface_hub.PyTorchModelHubMixin):
 
     with torch.cuda.amp.autocast(dtype=torch.bfloat16):
       for i in range(len(self.blocks)):
-        x = self.blocks[i](x, rotary_cos_sin, c, seqlens=None)
+        x = self.blocks[i](x, rotary_cos_sin, c, attention_mask)
       x = self.output_layer(x, c)
 
     return x
