@@ -315,6 +315,8 @@ class Diffusion(L.LightningModule):
   def forward(self, x, sigma, attention_mask=None):
     """Returns log score."""
     sigma = self._process_sigma(sigma)
+    if attention_mask is None:
+      attention_mask = getattr(self, '_sampling_attention_mask', None)
     with torch.cuda.amp.autocast(dtype=torch.float32):
       if self.config.backbone == 'dit':
         logits = self.backbone(x, sigma, attention_mask=attention_mask)
@@ -661,7 +663,9 @@ class Diffusion(L.LightningModule):
     return x
 
   @torch.no_grad()
-  def _sample(self, num_steps=None, eps=1e-5):
+  def _sample(
+      self, num_steps=None, eps=1e-5,
+      attention_mask=None, eos_token_id=None):
     """Generate samples from the model."""
     batch_size_per_gpu = self.config.loader.eval_batch_size
     if self.parameterization == 'ar':
@@ -672,6 +676,14 @@ class Diffusion(L.LightningModule):
     x = self._sample_prior(
       batch_size_per_gpu,
       self.config.model.length).to(self.device)
+    if attention_mask is not None:
+      if attention_mask.shape != x.shape:
+        raise ValueError(
+          f'attention_mask must have shape {tuple(x.shape)}, got '
+          f'{tuple(attention_mask.shape)}')
+      if eos_token_id is None:
+        raise ValueError('eos_token_id is required with attention_mask')
+      x = x.masked_fill(~attention_mask, eos_token_id)
     timesteps = torch.linspace(
       1, eps, num_steps + 1, device=self.device)
     dt = (1 - eps) / num_steps
@@ -692,6 +704,8 @@ class Diffusion(L.LightningModule):
         x = x_next
       else:
         x = self._analytic_update(x, t, dt)
+      if attention_mask is not None:
+        x = x.masked_fill(~attention_mask, eos_token_id)
 
     if self.config.sampling.noise_removal:
       t = timesteps[-1] * torch.ones(x.shape[0], 1,
@@ -701,9 +715,18 @@ class Diffusion(L.LightningModule):
       else:
         unet_conditioning = self.noise(t)[0]
         x = self.forward(x, unet_conditioning).argmax(dim=-1)
+    if attention_mask is not None:
+      x = x.masked_fill(~attention_mask, eos_token_id)
+      terminal_positions = attention_mask.sum(dim=1) - 1
+      x.scatter_(
+        1, terminal_positions[:, None],
+        torch.full(
+          (batch_size_per_gpu, 1), eos_token_id,
+          dtype=x.dtype, device=x.device))
     return x
 
-  def restore_model_and_sample(self, num_steps, eps=1e-5):
+  def restore_model_and_sample(
+      self, num_steps, eps=1e-5, attention_mask=None, eos_token_id=None):
     """Generate samples from the model."""
     # Lightning auto-casting is not working in this method for some reason
     if self.ema:
@@ -715,13 +738,23 @@ class Diffusion(L.LightningModule):
         self.noise.parameters()))
     self.backbone.eval()
     self.noise.eval()
-    samples = self._sample(num_steps=num_steps, eps=eps)
-    if self.ema:
-      self.ema.restore(itertools.chain(
-        self.backbone.parameters(),
-        self.noise.parameters()))
-    self.backbone.train()
-    self.noise.train()
+    if attention_mask is not None:
+      attention_mask = attention_mask.to(device=self.device, dtype=torch.bool)
+    previous_attention_mask = getattr(
+      self, '_sampling_attention_mask', None)
+    self._sampling_attention_mask = attention_mask
+    try:
+      samples = self._sample(
+        num_steps=num_steps, eps=eps,
+        attention_mask=attention_mask, eos_token_id=eos_token_id)
+    finally:
+      self._sampling_attention_mask = previous_attention_mask
+      if self.ema:
+        self.ema.restore(itertools.chain(
+          self.backbone.parameters(),
+          self.noise.parameters()))
+      self.backbone.train()
+      self.noise.train()
     return samples
 
   def get_score(self, x, sigma):
